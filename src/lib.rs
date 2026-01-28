@@ -55,6 +55,15 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use cc::Build;
+use nanoserde::DeJson;
+
+macro_rules! p {
+    ($($tokens: tt)*) => {
+        println!("cargo::warning={}", format!($($tokens)*))
+    }
+}
+
 /// Builder style configuration for a pending CMake build.
 pub struct Config {
     path: PathBuf,
@@ -84,6 +93,8 @@ pub struct Config {
     c_cfg: Option<cc::Build>,
     cxx_cfg: Option<cc::Build>,
     env_cache: HashMap<String, Option<OsString>>,
+    handle_linking: bool,
+    link_cpp_stdlib: bool,
 }
 
 /// Builds the native library rooted at `path` with the default cmake options.
@@ -209,6 +220,8 @@ impl Config {
             c_cfg: None,
             cxx_cfg: None,
             env_cache: HashMap::new(),
+            handle_linking: false,
+            link_cpp_stdlib: false,
         }
     }
 
@@ -433,6 +446,21 @@ impl Config {
         self
     }
 
+    /// Uses the CMake file-api to scan library dependencies and emit
+    /// cargo:rustc-link-lib and cargo:rustc-link-search directives as needed
+    ///
+    /// Defaults to false.
+    pub fn handle_linking(&mut self, handle_linking: bool) -> &mut Config {
+        self.handle_linking = handle_linking;
+        self
+    }
+
+    /// Links the appropriate C++ standard library with rustc
+    pub fn link_cpp_stdlib(&mut self, link_cpp_stdlib: bool) -> &mut Config {
+        self.link_cpp_stdlib = link_cpp_stdlib;
+        self
+    }
+
     /// Run this configuration, compiling the library with all the configured
     /// options.
     ///
@@ -559,6 +587,16 @@ impl Config {
 
         self.maybe_clear(&build_dir);
         let _ = fs::create_dir_all(&build_dir);
+
+        let mut file_api_dir = build_dir.clone();
+        file_api_dir.extend([".cmake", "api", "v1"]);
+
+        if self.handle_linking {
+            let query_dir = file_api_dir.join("query").join("client-cmake-rs");
+            let _ = fs::create_dir_all(&query_dir);
+
+            File::create(query_dir.join("codemodel-v2")).unwrap();
+        }
 
         // Add all our dependencies to our cmake paths
         let mut cmake_prefix_path = Vec::new();
@@ -830,6 +868,41 @@ impl Config {
             println!("CMake project was already configured. Skipping configuration step.");
         }
 
+        if self.handle_linking {
+            if let Some(codemodel_path) = find_codemodel(&file_api_dir) {
+                let input = fs::read_to_string(codemodel_path).unwrap();
+                let json: Codemodel = DeJson::deserialize_json(&input).unwrap();
+
+                let mut config = None;
+                for cfg in json.configurations {
+                    if cfg.name == build_type {
+                        config = Some(cfg);
+                        break;
+                    }
+                }
+
+                if let Some(config) = config {
+                    let target_name = self
+                        .cmake_target
+                        .clone()
+                        .unwrap_or_else(|| "install".to_string());
+
+                    let mut target = None;
+                    for t in &config.targets {
+                        if t.name == target_name {
+                            target = Some(t);
+                            break;
+                        }
+                    }
+
+                    if let Some(target) = target {
+                        let targets = read_targets(&config.targets, &file_api_dir.join("reply"));
+                        emit_link_directives(targets.get(&target.id).unwrap(), &targets, &build_dir);
+                    }
+                }
+            }
+        }
+
         // And build!
         let mut cmd = self.cmake_build_command(&target);
         cmd.current_dir(&build_dir);
@@ -892,6 +965,10 @@ impl Config {
         }
 
         run(&mut cmd, "cmake");
+
+        if self.link_cpp_stdlib {
+            link_cpp_stdlib(&target);
+        }
 
         println!("cargo:root={}", dst.display());
         dst
@@ -1088,6 +1165,43 @@ impl Default for Version {
     }
 }
 
+#[derive(Debug, DeJson)]
+struct CodemodelTarget {
+    pub name: String,
+    pub id: String,
+    pub jsonFile: String,
+}
+
+#[derive(Debug, DeJson)]
+struct CodemodelConfigurations {
+    pub name: String,
+    pub targets: Vec<CodemodelTarget>,
+}
+
+#[derive(Debug, DeJson)]
+struct Codemodel {
+    pub configurations: Vec<CodemodelConfigurations>,
+}
+
+#[derive(Debug, DeJson)]
+struct TargetPaths {
+    build: String,
+}
+
+#[derive(Debug, DeJson)]
+struct TargetDependency {
+    id: String,
+}
+
+#[derive(Debug, DeJson)]
+struct Target {
+    nameOnDisk: String,
+    paths: TargetPaths,
+    #[nserde(rename = "type")]
+    kind: String,
+    dependencies: Option<Vec<TargetDependency>>,
+}
+
 fn run(cmd: &mut Command, program: &str) {
     eprintln!("running: {:?}", cmd);
     let status = match cmd.status() {
@@ -1212,6 +1326,81 @@ fn find_cmake_executable(target: &str) -> Option<OsString> {
 #[cfg(not(windows))]
 fn find_cmake_executable(_target: &str) -> Option<OsString> {
     None
+}
+
+fn find_codemodel(query_dir: &Path) -> Option<PathBuf> {
+    let reply_dir = query_dir.join("reply");
+
+    for entry in fs::read_dir(reply_dir).unwrap() {
+        if let Ok(entry) = entry {
+            if entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .starts_with("codemodel-v2")
+            {
+                return Some(entry.path());
+            }
+        }
+    }
+
+    None
+}
+
+fn read_targets(targets: &Vec<CodemodelTarget>, reply_dir: &Path) -> HashMap<String, Target> {
+    let mut map = HashMap::new();
+
+    for target in targets {
+        let path = reply_dir.join(&target.jsonFile);
+        let input = fs::read_to_string(path).unwrap();
+        let json: Target = DeJson::deserialize_json(&input).unwrap();
+        map.insert(target.id.clone(), json);
+    }
+
+    map
+}
+
+fn emit_link_directives(main_target: &Target, targets: &HashMap<String, Target>, build_dir: &Path) {
+    if main_target.kind == "STATIC_LIBRARY" {
+        println!("cargo:rustc-link-search=native={}", build_dir.join(&main_target.paths.build).display());
+        println!("cargo:rustc-link-lib=static={}", libname_from_filename(&main_target.nameOnDisk));
+    }
+
+    if let Some(dep) = &main_target.dependencies {
+        for dep in dep {
+            let target = targets.get(&dep.id).unwrap();
+            emit_link_directives(target, targets, build_dir);
+        }
+    }
+}
+
+fn libname_from_filename(filename: &str) -> String {
+    if filename.ends_with(".a") {
+        let mut name = filename.strip_prefix("lib").unwrap_or(filename);
+        name = name.strip_suffix(".a").unwrap_or(name);
+        name.to_string()
+    } else if filename.ends_with(".lib") {
+        filename
+            .strip_suffix(".lib")
+            .unwrap_or(filename)
+            .to_string()
+    } else {
+        return filename.to_string();
+    }
+}
+
+fn link_cpp_stdlib(target: &str) {
+    // https://docs.rs/cc/latest/cc/#c-support
+    if target.contains("darwin") || target.contains("freebsd") || target.contains("openbsd") {
+        println!("cargo:rustc-link-lib=dylib=c++");
+    } else if target.contains("android") {
+        println!("cargo:rustc-link-lib=dylib=c++_shared");
+    } else if target.contains("msvc")  {
+        // Nothing
+    } else {
+        // Assume a Linux-like system
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
 }
 
 #[cfg(test)]
