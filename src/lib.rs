@@ -55,14 +55,8 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cc::Build;
 use nanoserde::DeJson;
 
-macro_rules! p {
-    ($($tokens: tt)*) => {
-        println!("cargo::warning={}", format!($($tokens)*))
-    }
-}
 
 /// Builder style configuration for a pending CMake build.
 pub struct Config {
@@ -455,7 +449,8 @@ impl Config {
         self
     }
 
-    /// Links the appropriate C++ standard library with rustc
+    /// Dynamicly links the appropriate C++ standard library with rustc using the 
+    /// rules of cc::Build.
     pub fn link_cpp_stdlib(&mut self, link_cpp_stdlib: bool) -> &mut Config {
         self.link_cpp_stdlib = link_cpp_stdlib;
         self
@@ -1169,7 +1164,8 @@ impl Default for Version {
 struct CodemodelTarget {
     pub name: String,
     pub id: String,
-    pub jsonFile: String,
+    #[nserde(rename = "jsonFile")]
+    pub json_file: String,
 }
 
 #[derive(Debug, DeJson)]
@@ -1195,7 +1191,8 @@ struct TargetDependency {
 
 #[derive(Debug, DeJson)]
 struct Target {
-    nameOnDisk: String,
+    #[nserde(rename = "nameOnDisk")]
+    name_on_disk: String,
     paths: TargetPaths,
     #[nserde(rename = "type")]
     kind: String,
@@ -1351,7 +1348,7 @@ fn read_targets(targets: &Vec<CodemodelTarget>, reply_dir: &Path) -> HashMap<Str
     let mut map = HashMap::new();
 
     for target in targets {
-        let path = reply_dir.join(&target.jsonFile);
+        let path = reply_dir.join(&target.json_file);
         let input = fs::read_to_string(path).unwrap();
         let json: Target = DeJson::deserialize_json(&input).unwrap();
         map.insert(target.id.clone(), json);
@@ -1363,7 +1360,7 @@ fn read_targets(targets: &Vec<CodemodelTarget>, reply_dir: &Path) -> HashMap<Str
 fn emit_link_directives(main_target: &Target, targets: &HashMap<String, Target>, build_dir: &Path) {
     if main_target.kind == "STATIC_LIBRARY" {
         println!("cargo:rustc-link-search=native={}", build_dir.join(&main_target.paths.build).display());
-        println!("cargo:rustc-link-lib=static={}", libname_from_filename(&main_target.nameOnDisk));
+        println!("cargo:rustc-link-lib=static={}", libname_from_filename(&main_target.name_on_disk));
     }
 
     if let Some(dep) = &main_target.dependencies {
